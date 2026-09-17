@@ -1072,6 +1072,7 @@ class _ProcessingWorker(QThread):
         frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
         source_image = None
         last_source_path = None
+        reported_source_error = None
         prev_time = time.time()
         fps_update_interval = 0.5
         frame_count = 0
@@ -1096,14 +1097,22 @@ class _ProcessingWorker(QThread):
                     modules.globals.source_path
                     and modules.globals.source_path != last_source_path
                 ):
-                    last_source_path = modules.globals.source_path
                     source_frame = imread_unicode(modules.globals.source_path)
                     if source_frame is None:
-                        update_status(
-                            f"Could not read source image: {modules.globals.source_path}"
-                        )
+                        # Leave last_source_path untouched so a source that is
+                        # only transiently unreadable (still being written, on a
+                        # volume that just went away) is retried on a later
+                        # frame instead of being given up on until the user
+                        # picks a different file. Report it once per path.
                         source_image = None
+                        if reported_source_error != modules.globals.source_path:
+                            reported_source_error = modules.globals.source_path
+                            update_status(
+                                f"Could not read source image: {modules.globals.source_path}"
+                            )
                     else:
+                        last_source_path = modules.globals.source_path
+                        reported_source_error = None
                         source_image = get_one_face(source_frame)
 
                 det_count += 1
