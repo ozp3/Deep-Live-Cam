@@ -219,9 +219,9 @@ _APP: Optional[QApplication] = None
 _MAIN: Optional["MainWindow"] = None
 _PREVIEW: Optional["PreviewWindow"] = None
 _WEBCAM_PREVIEW: Optional["WebcamPreviewWindow"] = None
-# Workers that outlived their window's close. Destroying a running QThread is a
-# fatal error in Qt, so they are parked here until the process exits.
-_STRAY_WORKERS: List[QThread] = []
+# How long to wait quietly for a live-preview worker to notice the stop flag
+# before saying so. Shutdown then keeps waiting: it has to finish.
+WORKER_SHUTDOWN_GRACE_MS = 30000
 _MAPPER: Optional["MapperDialog"] = None
 _LIVE_MAPPER: Optional["LiveMapperDialog"] = None
 _LANG: Optional[LanguageManager] = None
@@ -805,11 +805,24 @@ class MainWindow(QMainWindow):
             if not content_type.startswith("image/"):
                 raise ValueError(f"expected an image, got {content_type!r}")
             temp_path = os.path.join(tempfile.gettempdir(), "deep_live_cam_random_face.jpg")
-            with open(temp_path, "wb") as f:
-                f.write(response.content)
-            # Adopt the file as the source only once it is known to be readable,
-            # otherwise a failed fetch leaves source_path pointing at garbage.
-            pixmap = render_image_preview(temp_path, (200, 200))
+            staging_path = f"{temp_path}.part"
+            # Download into a staging file and validate there. Writing straight
+            # to temp_path would destroy the image currently in use whenever a
+            # later fetch comes back bad, and content-type alone does not prove
+            # the bytes decode.
+            try:
+                with open(staging_path, "wb") as f:
+                    f.write(response.content)
+                pixmap = render_image_preview(staging_path, (200, 200))
+                if imread_unicode(staging_path) is None:
+                    raise ValueError("downloaded image could not be decoded")
+                os.replace(staging_path, temp_path)
+            except Exception:
+                try:
+                    os.remove(staging_path)
+                except OSError:
+                    pass
+                raise
             modules.globals.source_path = temp_path
             self.source_label.setPixmap(pixmap)
             self.source_label.setText("")
@@ -1099,12 +1112,16 @@ class _ProcessingWorker(QThread):
                 ):
                     source_frame = imread_unicode(modules.globals.source_path)
                     if source_frame is None:
-                        # Leave last_source_path untouched so a source that is
-                        # only transiently unreadable (still being written, on a
-                        # volume that just went away) is retried on a later
-                        # frame instead of being given up on until the user
-                        # picks a different file. Report it once per path.
+                        # Clear the cached path along with the image. It keeps
+                        # a source that is only transiently unreadable (still
+                        # being written, on a volume that just went away) from
+                        # being given up on, and it keeps a bad pick from
+                        # sticking: with the path cached, A -> unreadable B -> A
+                        # never reloaded A, so swapping stayed off. Retrying
+                        # every frame is cheap; the message is reported once per
+                        # path so it cannot flood the status line.
                         source_image = None
+                        last_source_path = None
                         if reported_source_error != modules.globals.source_path:
                             reported_source_error = modules.globals.source_path
                             update_status(
@@ -1278,15 +1295,24 @@ class WebcamPreviewWindow(QWidget):
                 timer.stop()
             except Exception:
                 pass
+        # Shutdown has to actually complete. Qt aborts the process when a
+        # running QThread is destroyed, and holding a straggler in a module
+        # global only moves that abort to interpreter exit. Both loops re-check
+        # the stop flag between bounded operations (a camera read, a 50ms queue
+        # get, one inference), so waiting terminates; a first-time model load
+        # is simply slow, which is what the grace period absorbs quietly.
         for name in ("_capture_worker", "_processing_worker"):
             worker = getattr(self, name, None)
             if worker is None:
                 continue
-            # A worker can sit well past a couple of seconds inside a first-time
-            # model load (GFPGAN on CoreML compiles for several seconds), and Qt
-            # aborts the process if a running QThread is ever garbage collected.
-            if not worker.wait(30000):
-                _STRAY_WORKERS.append(worker)
+            if not worker.wait(WORKER_SHUTDOWN_GRACE_MS):
+                print(
+                    f"[webcam] still waiting for {name[1:]} to stop...",
+                    flush=True,
+                )
+                worker.wait()
+        # Only now: releasing the capture while the capture thread could still
+        # be inside cap.read() is not safe.
         cap = getattr(self, "_cap", None)
         if cap is not None:
             try:
